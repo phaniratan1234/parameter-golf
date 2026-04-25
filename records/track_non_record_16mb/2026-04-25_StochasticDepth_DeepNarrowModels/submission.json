@@ -1,0 +1,10 @@
+{
+  "track": "non_record_16mb",
+  "date": "2026-04-25",
+  "name": "Stochastic Depth (LayerDrop) for Deep Narrow Models",
+  "author": "Phani Rata Nyalamanchili",
+  "github_id": "phaniratanyalamanchili",
+  "val_bpb": null,
+  "val_loss": null,
+  "bytes_total": null
+}
