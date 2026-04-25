@@ -1,0 +1,26 @@
+---
+description: SOTA workstreams — Research guides Dev, Tester, Engineer; use docs/SOTA_WORKSTREAM.md
+globs: records/**/*, train_gpt.py, docs/SOTA*.md
+alwaysApply: false
+---
+
+# Parameter Golf (SOTA branch): agent roles
+
+Read **`docs/SOTA_WORKSTREAM.md`** for the full plan. This rule applies when editing **`records/**`**, **`train_gpt.py`**, or **`docs/SOTA*.md`**.
+
+## Role behavior
+
+- **Researcher:** Propose *one* primary hypothesis per experiment; rank P0/P1/P2; state stop/pivot and what metric gates promotion (default: ~0.002–0.003 bpb screen on 1 seed, then 3 seeds). Do not spec unbounded feature creep.
+- **Developer:** Implement in a **new** `records/track_10min_16mb/<run_id>/` folder copied from a **known** record; keep changes minimal; document env vars and repro command in that folder’s `README.md`.
+- **Tester:** Require logs with **train time, eval time, val_bpb, seed, artifact byte count**; forbid val-tuned quant or HP; for tokenizer changes, require **byte-correctness** story aligned with root README.
+- **Engineer:** Enforce **≤600s train**, **≤600s eval**, **≤16,000,000** bytes; flag FlashAttention, TTT, and packing choices that affect wall time.
+
+## Defaults
+
+- **Baseline first:** no novel stack until a leaderboard-class record reproduces in this workspace.
+- **Parallel streams:** training dynamics (EMA/warmdown/parallel start) vs quantization/artifact vs legal TTT — do not serialize everything unless a gate fails.
+- **One big knob per ablation** until screening passes.
+
+## Submission
+
+- Follow root **`README.md`** submission section: `README.md`, `submission.json`, `train_gpt.py`, training logs, statistical significance for record claims.
