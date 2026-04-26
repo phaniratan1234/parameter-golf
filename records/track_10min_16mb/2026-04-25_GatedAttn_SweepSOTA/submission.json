@@ -1,0 +1,19 @@
+{
+  "name": "Gated Attention + SOTA Sweep",
+  "description": "Novel gated attention output + cosine warmdown + systematic hyperparameter sweep on SOTA recipe",
+  "date": "2026-04-25",
+  "track": "10min_16mb",
+  "hardware": "8xH100 SXM",
+  "data_variant": "sp8192",
+  "novel_techniques": [
+    "Gated Attention Output (AttnOutGate): learnable sigmoid gate on attention output before projection",
+    "Cosine warmdown schedule option",
+    "Systematic sweep of QK-Gain, parallel residual start, recurrence loops"
+  ],
+  "base_recipe": "2026-04-09_SP8192_3LayerRecur_ParResid_QK525_LegalTTT",
+  "val_bpb": null,
+  "val_loss": null,
+  "bytes_total": null,
+  "seeds": [42, 314, 999],
+  "results": {}
+}
