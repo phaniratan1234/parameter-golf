@@ -140,10 +140,27 @@ class Hyperparameters:
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     is_main_process = rank == 0
     grad_accum_steps = 8 // world_size
-    datasets_dir = os.path.join(data_dir, 'datasets', f"fineweb10B_sp{vocab_size}")
+    # Datasets: default layout is DATA_DIR/datasets/...; cached_challenge_fineweb.py
+    # also places under DATA_DIR/data/datasets/ when DATA_DIR is the repo root.
+    _d1 = os.path.join(data_dir, 'datasets', f"fineweb10B_sp{vocab_size}")
+    _d2 = os.path.join(data_dir, 'data', 'datasets', f"fineweb10B_sp{vocab_size}")
+    datasets_dir = _d1 if os.path.isdir(_d1) else _d2
     train_files = os.path.join(datasets_dir, 'fineweb_train_*.bin')
     val_files = os.path.join(datasets_dir, 'fineweb_val_*.bin')
-    tokenizer_path = os.path.join(data_dir, 'tokenizers', f"fineweb_{vocab_size}_bpe.model")
+    # Tokenizer: same, plus optional TOKENIZER_PATH override and data/tokenizers/ fallback
+    # (data/cached_challenge_fineweb.py writes to repo's data/tokenizers/).
+    _t_default = f"fineweb_{vocab_size}_bpe.model"
+    _t1 = os.path.join(data_dir, 'tokenizers', _t_default)
+    _t2 = os.path.join(data_dir, 'data', 'tokenizers', _t_default)
+    _to = os.environ.get('TOKENIZER_PATH')
+    if _to:
+        tokenizer_path = _to
+    elif os.path.isfile(_t1):
+        tokenizer_path = _t1
+    elif os.path.isfile(_t2):
+        tokenizer_path = _t2
+    else:
+        tokenizer_path = _t1
     logfile = f"logs/{run_id}.txt"
     model_path = 'final_model.pt'
     quantized_model_path = 'final_model.int6.ptz'
