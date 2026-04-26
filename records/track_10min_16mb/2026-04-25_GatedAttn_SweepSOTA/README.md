@@ -1,6 +1,30 @@
-# Record Attempt: Stochastic Recurrence + Multi-Technique SOTA Sweep
+# Record: Quantization-Recovery In-Place TTT Transformer (QRI-IPTT)
 
-**Target:** Beat current SOTA of 1.0810 BPB (3-seed mean)
+**Target line:** A review-clean submission that unifies **legal TTT**, **gating / Smear**, and **quantization repair** on the same residual errors—without CaseOps, disputed normalization, or custom tokenizer byte accounting.
+
+**Primary design (this folder implements):**
+
+| Mechanism | Role | Key env |
+|-----------|------|---------|
+| **In-place TTT (IPTT)** | Replaces default **LoRA-TTT** as the main fast-weight path: low-rank delta on **selected MLP output** paths (PiSSA init), legal TTT only | `TIT_MODE=iptt` `TTT_LORA=0` |
+| **SmearGate** | Tiny “routing”: light blend with previous position (post-embed / norm) | `SMEAR_GATE=1` |
+| **Attention-output gating** | Learnable per-dim scale on attention output (public PR pattern) | `ATTN_OUT_GATE=1` |
+| **Pre-GPTQ LQER (rank-4)** | One explicit **quantization-repair** step: fake-quant error → rank-`k` SVD → **merged into** linear weights (0 extra artifact params) | `PRE_GPTQ_LQER=1` `LQER_RANK=4` |
+| **Training loss** | Exact next-token **cross-entropy**; no large auxiliary on the headline path | (default) |
+
+**Expected landing (inferential; tokenizer unchanged):** a plausible band for a competitive run is roughly **1.056–1.066** TTT BPB. Getting **below ~1.058** needs IPTT to beat prior **LoRA-TTT** in the same harness **and** LQER to recover most low-bit damage—**plausible, not guaranteed**.
+
+**Evidence narrative (from public challenge history, qualitative):** ~**0.0081 BPB** from legal 4-epoch TTT; ~**0.0096 BPB** from Smear + attn-out gating on a merged line; monotonic but smaller gain from **alpha warm-start-A LoRA-TTT**; **~1.06157**-class stacks show **quant repair** can still help after other gains. This record aims to align those mechanisms on **one** design instead of separate patches.
+
+**How to run the full stack:** see **`run_experiments.sh`** experiment **`A16_iptt_smear_lqer`** (uses `train_gpt.py` in this directory). Use `cd` to this folder and set **`DATA_DIR`** to the parent of `data/datasets/...`.
+
+---
+
+## Stochastic Recurrence (earlier ablation thread)
+
+**Note:** The following section described an **additional** ablation (stochastic depth on recurrence). It is **not** part of the default QRI-IPTT submission story unless explicitly enabled by env.
+
+**Target (historical text):** Beat current SOTA of 1.0810 BPB (3-seed mean)
 
 ## Novel Contribution: Stochastic Recurrence
 
