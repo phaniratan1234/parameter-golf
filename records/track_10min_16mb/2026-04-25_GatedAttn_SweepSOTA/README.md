@@ -16,7 +16,20 @@
 
 **Evidence narrative (from public challenge history, qualitative):** ~**0.0081 BPB** from legal 4-epoch TTT; ~**0.0096 BPB** from Smear + attn-out gating on a merged line; monotonic but smaller gain from **alpha warm-start-A LoRA-TTT**; **~1.06157**-class stacks show **quant repair** can still help after other gains. This record aims to align those mechanisms on **one** design instead of separate patches.
 
-**How to run the full stack:** see **`run_experiments.sh`** experiment **`A16_iptt_smear_lqer`** (uses `train_gpt.py` in this directory). Use `cd` to this folder and set **`DATA_DIR`** to the parent of `data/datasets/...`.
+**How to run (core only — no Polar / pre-quant TTT / late QAT / SWA / EMA):** **`run_experiments.sh`** experiment **`A16_iptt_smear_lqer`**, or the minimal **`env` + `torchrun`** below. Set **`DATA_DIR`** to the repo root (so `data/datasets/...` and `data/tokenizers/...` resolve). **`run_experiments.sh`**’s **`COMMON_ENV`** still turns on legal TTT (`TTT_ENABLED=1`, chunk 2048, adaptive) — that is the required eval path, not optional extras.
+
+```bash
+REPO="/workspace/parameter-golf"
+export DATA_DIR="$REPO"
+cd "$REPO/records/track_10min_16mb/2026-04-25_GatedAttn_SweepSOTA"
+mkdir -p logs
+env TTT_ENABLED=1 TTT_LORA=0 TTT_CHUNK_TOKENS=2048 TTT_ADAPTIVE=1 TTT_LR=0.005 TTT_EPOCHS=2 \
+  TIT_MODE=iptt QK_GAIN_INIT=5.25 ATTN_OUT_GATE=1 SMEAR_GATE=1 PRE_GPTQ_LQER=1 LQER_RANK=4 LAYER_SCALE_INIT=1e-4 \
+  POLAR_EXPRESS=0 PRE_QUANT_TTT=0 LATE_QAT_ENABLED=0 SWA_ENABLED=0 EMA_ANNEAL=0 MUP_ENABLED=0 STOCHASTIC_RECURRENCE=0 \
+  SEED=42 \
+  torchrun --standalone --nproc_per_node=8 ./train_gpt.py \
+  2>&1 | tee logs/A16_qri_iptt_core_seed42.log
+```
 
 ---
 

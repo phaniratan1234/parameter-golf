@@ -96,13 +96,12 @@ run_experiment "A14_stoch_recur" 42 \
 run_experiment "A15_ultimate" 42 \
     "QK_GAIN_INIT=5.5 ATTN_OUT_GATE=1 WARMDOWN_TYPE=cosine POLAR_EXPRESS=1 PRE_QUANT_TTT=1 SWA_ENABLED=1 SWA_EVERY=50 LATE_QAT_ENABLED=1 EMA_ANNEAL=1 LAYER_SCALE_INIT=1e-4 TTT_LORA=1 TTT_ADAPTIVE=1"
 
-# A16: Plan stack — IPTT + SmearGate + pre-GPTQ LQER + strong train (matches A9/A11/A15-style wins; TTT_LORA=0)
-# Polar + pre-quant TTT (train) + late QAT; SWA+EMA anneal (A15) — TIT_MODE=iptt for val TTT
+# A16: QRI-IPTT core only — IPTT, SmearGate, attn-out gating, pre-GPTQ LQER; no Polar/pre-quant-TTT/late QAT/SWA/EMA (see A9/A15 for those)
 run_experiment "A16_iptt_smear_lqer" 42 \
-    "TIT_MODE=iptt TTT_LORA=0 QK_GAIN_INIT=5.5 ATTN_OUT_GATE=1 SMEAR_GATE=1 PRE_GPTQ_LQER=1 LQER_RANK=4 WARMDOWN_TYPE=cosine LAYER_SCALE_INIT=1e-4 POLAR_EXPRESS=1 POLAR_EXPRESS_STEPS=7 PRE_QUANT_TTT=1 PRE_QUANT_TTT_LR=0.003 LATE_QAT_ENABLED=1 LATE_QAT_START_FRAC=0.9 SWA_ENABLED=1 SWA_START_FRAC=0.8 SWA_EVERY=50 EMA_ANNEAL=1 EMA_DECAY_START=0.99 EMA_DECAY_END=0.999"
+    "TIT_MODE=iptt TTT_LORA=0 QK_GAIN_INIT=5.25 ATTN_OUT_GATE=1 SMEAR_GATE=1 PRE_GPTQ_LQER=1 LQER_RANK=4 LAYER_SCALE_INIT=1e-4 POLAR_EXPRESS=0 PRE_QUANT_TTT=0 LATE_QAT_ENABLED=0 SWA_ENABLED=0 EMA_ANNEAL=0 MUP_ENABLED=0 STOCHASTIC_RECURRENCE=0"
 
 echo "============================================"
-echo "PHASE 1 COMPLETE — 16 experiments (A16 = IPTT + Smear + LQER)"
+echo "PHASE 1 COMPLETE — 16 experiments (A16 = QRI-IPTT core: IPTT + Smear + LQER)"
 echo "Review logs in $LOG_DIR"
 echo "grep for 'val_bpb' to compare results:"
 echo "  grep 'val_bpb' $LOG_DIR/*.log"
