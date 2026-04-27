@@ -1492,6 +1492,27 @@ def _ttt_freeze_iptt_only(
     return _ttt_iptt_param_list(iptt_mods)
 
 
+def _ttt_ddp_allreduce_grads(world_size: int, ttt_params: list) -> None:
+    """In-place DDP grad avg. If grad is None (padding round), all ranks pass zeros
+    so the number of all_reduces is identical on every process (avoids NCCL hang)."""
+    if world_size <= 1:
+        return
+    for p in ttt_params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p, memory_format=torch.preserve_format)
+        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+
+def _ttt_max_inner_microsteps(h, n_local: int, device) -> int:
+    """Max micro-batch count across ranks for TTT inner SGD/IPTT-LoRA loops."""
+    n_local = int(max(0, n_local))
+    if h.world_size > 1 and dist.is_available() and dist.is_initialized():
+        t = torch.tensor([n_local], device=device, dtype=torch.int32)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return int(t.item())
+    return n_local
+
+
 def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
     rank = h.rank
     world_size = h.world_size
@@ -1601,8 +1622,17 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
         ch_loss = torch.zeros((), device=device, dtype=torch.float64)
         ch_tok = torch.zeros((), device=device, dtype=torch.float64)
         base_model.eval()
-        for bi in range(0, len(my_windows), batch_seqs):
-            batch_ws = my_windows[bi:bi + batch_seqs]
+        n_w_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs if my_windows else 0
+        max_w_batches = _ttt_max_inner_microsteps(h, n_w_batches, device)
+        for wbi in range(max_w_batches):
+            in_shard = wbi * batch_seqs < len(my_windows)
+            if in_shard:
+                bi = wbi * batch_seqs
+                batch_ws = my_windows[bi:bi + batch_seqs]
+            else:
+                # NCCL: all ranks same # of compiled_logits calls; this rank has no
+                # assigned windows (shard empty) — re-use a chunk window, no score add.
+                batch_ws = [windows[0]]
             bsz = len(batch_ws)
             x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
             y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
@@ -1623,6 +1653,8 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                     logits.reshape(-1, logits.size(-1)).float(),
                     y_batch.reshape(-1), reduction='none',
                 ).reshape(bsz, seq_len)
+            if not in_shard:
+                continue
             for i, ws_inner in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws_inner == 0 else context_size
@@ -1657,6 +1689,8 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
         if not is_last_chunk and n_steps > 0 and optimizer is not None:
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
+            my_seq_s, my_seq_e, my_chunk_seqs = 0, 0, 0
+            n_bs_loops = 0
             if chunk_seqs > 0:
                 cos_lr = h.ttt_lr * .5 * (1. + math.cos(
                     math.pi * ci / max(num_chunks - 1, 1)
@@ -1666,15 +1700,25 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                 my_seq_s = chunk_seqs * rank // world_size
                 my_seq_e = chunk_seqs * (rank + 1) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
-                for _ep in range(n_steps):
-                    for bs in range(0, my_chunk_seqs, batch_seqs):
-                        be = min(bs + batch_seqs, my_chunk_seqs)
-                        actual_bs = my_seq_s + bs
+                n_bs_loops = (max(0, my_chunk_seqs) + batch_seqs - 1) // batch_seqs
+            max_loops = _ttt_max_inner_microsteps(h, n_bs_loops, device)
+            for _ep in range(n_steps):
+                for bi in range(max_loops):
+                    do_step = bool(
+                        chunk_seqs > 0 and max_loops > 0
+                        and (bi * batch_seqs) < my_chunk_seqs
+                    )
+                    oob, bs0, be0 = True, 0, 0
+                    if do_step:
+                        bs0 = bi * batch_seqs
+                        be0 = min(bs0 + batch_seqs, my_chunk_seqs)
+                        end1 = chunk_start + (my_seq_s + be0) * seq_len + 1
+                        oob = end1 > val_data.val_tokens.numel()
+                    if do_step and not oob:
+                        actual_bs = my_seq_s + bs0
                         start_tok = chunk_start + actual_bs * seq_len
-                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                        if end_tok > val_data.val_tokens.numel():
-                            continue
-                        local = val_data.val_tokens[start_tok:end_tok].to(
+                        end2 = chunk_start + (my_seq_s + be0) * seq_len + 1
+                        local = val_data.val_tokens[start_tok:end2].to(
                             device=device, dtype=torch.int64
                         )
                         x = local[:-1].reshape(-1, seq_len)
@@ -1683,12 +1727,11 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                             loss = base_model(x, y)
                         loss.backward()
-                        if world_size > 1:
-                            for p in ttt_params:
-                                if p.grad is not None:
-                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, 1.)
-                        optimizer.step()
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+                    _ttt_ddp_allreduce_grads(world_size, ttt_params)
+                    torch.nn.utils.clip_grad_norm_(ttt_params, 1.)
+                    optimizer.step()
         elif not is_last_chunk and n_steps > 0 and optims is not None:
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
@@ -1698,28 +1741,38 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
             else:
                 my_seq_s, my_e2 = 0, 0
             my_chunk_seqs = my_e2 - my_seq_s
+            n_bs_loops = (max(0, my_chunk_seqs) + batch_seqs - 1) // batch_seqs
+            max_loops = _ttt_max_inner_microsteps(h, n_bs_loops, device)
             for _ in range(n_steps):
-                for bs in range(0, max(0, my_chunk_seqs), batch_seqs):
-                    be = min(bs + batch_seqs, my_chunk_seqs)
-                    actual_bs = my_seq_s + bs
-                    start_tok = chunk_start + actual_bs * seq_len
-                    end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                    if end_tok > val_data.val_tokens.numel():
-                        continue
-                    local = val_data.val_tokens[start_tok:end_tok].to(
-                        device=device, dtype=torch.int64
+                for bi in range(max_loops):
+                    do_step = bool(
+                        chunk_seqs > 0 and max_loops > 0
+                        and (bi * batch_seqs) < my_chunk_seqs
                     )
-                    x = local[:-1].reshape(-1, seq_len)
-                    y = local[1:].reshape(-1, seq_len)
-                    for opt in optims:
-                        opt.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        loss = base_model(x, y)
-                    loss.backward()
-                    if world_size > 1:
-                        for p in ttt_params:
-                            if p.grad is not None:
-                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    oob, bs0, be0 = True, 0, 0
+                    if do_step:
+                        bs0 = bi * batch_seqs
+                        be0 = min(bs0 + batch_seqs, my_chunk_seqs)
+                        end1 = chunk_start + (my_seq_s + be0) * seq_len + 1
+                        oob = end1 > val_data.val_tokens.numel()
+                    if do_step and not oob:
+                        actual_bs = my_seq_s + bs0
+                        start_tok = chunk_start + actual_bs * seq_len
+                        end2 = chunk_start + (my_seq_s + be0) * seq_len + 1
+                        local = val_data.val_tokens[start_tok:end2].to(
+                            device=device, dtype=torch.int64
+                        )
+                        x = local[:-1].reshape(-1, seq_len)
+                        y = local[1:].reshape(-1, seq_len)
+                        for opt in optims:
+                            opt.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            loss = base_model(x, y)
+                        loss.backward()
+                    else:
+                        for opt in optims:
+                            opt.zero_grad(set_to_none=True)
+                    _ttt_ddp_allreduce_grads(world_size, ttt_params)
                     torch.nn.utils.clip_grad_norm_(ttt_params, 1.)
                     for opt in optims:
                         opt.step()
