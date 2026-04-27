@@ -107,12 +107,27 @@ class Hyperparameters:
     ttt_epochs = int(os.environ.get('TTT_EPOCHS', 3))
     ttt_momentum = float(os.environ.get('TTT_MOMENTUM', .9))
     ttt_chunk_tokens = int(os.environ.get('TTT_CHUNK_TOKENS', 2048))
-    ttt_lora = bool(int(os.environ.get('TTT_LORA', '1')))
-    lora_rank = int(os.environ.get('LORA_RANK', '8'))
-    lora_last_n_attn = int(os.environ.get('LORA_LAST_N_ATTN', '3'))
-    lora_last_n_mlp = int(os.environ.get('LORA_LAST_N_MLP', '2'))
+    ttt_lora = bool(int(os.environ.get('TTT_LORA', '0')))
+    lora_rank = int(os.environ.get('TTT_LORA_RANK', os.environ.get('LORA_RANK', '8')))
+    lora_last_n_attn = int(os.environ.get(
+        'TTT_LORA_LAST_N_ATTN', os.environ.get('LORA_LAST_N_ATTN', '3')
+    ))
+    lora_last_n_mlp = int(os.environ.get(
+        'TTT_LORA_LAST_N_MLP', os.environ.get('LORA_LAST_N_MLP', '2')
+    ))
+    ttt_lora_mlp_fc = bool(int(os.environ.get('TTT_LORA_MLP_FC', '1')))
     ttt_lora_lr_a = float(os.environ.get('TTT_LORA_LR_A', '1.25e-4'))
     ttt_lora_lr_b = float(os.environ.get('TTT_LORA_LR_B', '2e-3'))
+    ttt_lora_clip = float(os.environ.get('TTT_LORA_CLIP', '0.0'))
+    ttt_one_step = bool(int(os.environ.get('TTT_ONE_STEP', '0')))
+    ttt_difficulty_gate = bool(int(os.environ.get('TTT_DIFFICULTY_GATE', '0')))
+    ttt_skip_easy = int(os.environ.get('TTT_SKIP_EASY', '1'))
+    ttt_easy_margin = float(os.environ.get('TTT_EASY_MARGIN', '0.04'))
+    ttt_hard_margin = float(os.environ.get('TTT_HARD_MARGIN', '0.06'))
+    ttt_hard_lr_mult = float(os.environ.get('TTT_HARD_LR_MULT', '1.0'))
+    ttt_normal_lr_mult = float(os.environ.get('TTT_NORMAL_LR_MULT', '0.5'))
+    ttt_ema_bpb_alpha = float(os.environ.get('TTT_EMA_BPB_ALPHA', '0.1'))
+    ttt_lora_pissa = bool(int(os.environ.get('TTT_LORA_PISSA', '1')))
     ttt_adaptive = bool(int(os.environ.get('TTT_ADAPTIVE', '1')))
     ttt_tau_easy = float(os.environ.get('TTT_TAU_EASY', '2.0'))
     ttt_tau_hard = float(os.environ.get('TTT_TAU_HARD', '2.45'))
@@ -134,6 +149,18 @@ class Hyperparameters:
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 2e1))
+    awq_gptq_precond = bool(int(os.environ.get('AWQ_GPTQ_PRECOND', '0')))
+    awq_alpha = float(os.environ.get('AWQ_ALPHA', '0.5'))
+    awq_target_last_n = int(os.environ.get('AWQ_TARGET_LAST_N', '4'))
+    awq_scale_min = float(os.environ.get('AWQ_SCALE_MIN', '0.25'))
+    awq_scale_max = float(os.environ.get('AWQ_SCALE_MAX', '4.0'))
+    mixed_bit_gptq = bool(int(os.environ.get('MIXED_BIT_GPTQ', '0')))
+    mixed_bit_promote_topk = int(os.environ.get('MIXED_BIT_PROMOTE_TOPK', '4'))
+    mixed_bit_demote_bottomk = int(os.environ.get('MIXED_BIT_DEMOTE_BOTTOMK', '4'))
+    mixed_bit_promote_bits = int(os.environ.get('MIXED_BIT_PROMOTE_BITS', '8'))
+    mixed_bit_demote_bits = int(os.environ.get('MIXED_BIT_DEMOTE_BITS', '5'))
+    mixed_bit_protect_embed = bool(int(os.environ.get('MIXED_BIT_PROTECT_EMBED', '1')))
+    art_max_bytes = int(os.environ.get('ART_MAX_BYTES', str(16 * 1024 * 1024)))
     distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     rank = int(os.environ.get('RANK', '0'))
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -355,6 +382,13 @@ class CastedLinear(nn.Linear):
     qat_clip_range = 31
 
     def forward(self, x):
+        s = getattr(self, 'awq_in_scale', None)
+        if s is not None and s.numel() > 0:
+            s = s.to(device=x.device, dtype=x.dtype)
+            if x.ndim == 3:
+                x = x * (1.0 / s).view(1, 1, -1)
+            else:
+                x = x * (1.0 / s).view(1, -1)
         w = self.weight.to(x.dtype)
         if CastedLinear.qat_enabled and self.training:
             cr = CastedLinear.qat_clip_range
@@ -421,11 +455,14 @@ def install_ttt_lora(gpt: 'GPT', h, device) -> list[LinearWithLoRA]:
         lora_mods.append(b.attn.proj)
     for li in range(max(0, h.num_layers - h.lora_last_n_mlp), h.num_layers):
         b = gpt.blocks[li]
-        if isinstance(b.mlp.proj, LinearWithLoRA):
-            continue
-        w = b.mlp.proj
-        b.mlp.proj = LinearWithLoRA(w, h.lora_rank).to(device)
-        lora_mods.append(b.mlp.proj)
+        if getattr(h, 'ttt_lora_mlp_fc', True) and not isinstance(b.mlp.fc, LinearWithLoRA):
+            wfc = b.mlp.fc
+            b.mlp.fc = LinearWithLoRA(wfc, h.lora_rank).to(device)
+            lora_mods.append(b.mlp.fc)
+        if not isinstance(b.mlp.proj, LinearWithLoRA):
+            w = b.mlp.proj
+            b.mlp.proj = LinearWithLoRA(w, h.lora_rank).to(device)
+            lora_mods.append(b.mlp.proj)
     return lora_mods
 
 
@@ -1089,6 +1126,94 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     return hessians
 
 
+def _awq_layer_ok(name: str, h) -> bool:
+    """mlp.fc, mlp.proj, attn.proj on last-AWQ_TARGET_LAST_N blocks only."""
+    m = re.search(r'blocks\.(\d+)\.(mlp|attn)\.(\w+)', name)
+    if m is None or not name.endswith('.weight'):
+        return False
+    li, region, comp = int(m.group(1)), m.group(2), m.group(3)
+    n = h.awq_target_last_n
+    if li < h.num_layers - n:
+        return False
+    if region == 'mlp' and comp in ('fc', 'proj'):
+        return True
+    if region == 'attn' and comp == 'proj':
+        return True
+    return False
+
+
+def collect_awq_mae_scales(
+    model, train_loader, h, device, n_batches: int,
+) -> dict[str, torch.Tensor]:
+    """Per-input-channel mean |x|; s_j = clip(mean^alpha, min, max). Returns name -> 1D fp32."""
+    acc: dict[str, dict] = {}
+    hooks = []
+
+    def make_hook(n: str, inf: int):
+        def hook_fn(module, inp, out):
+            x = inp[0].detach().float()
+            if x.ndim == 3:
+                x = x.reshape(-1, x.shape[-1])
+            c = int(inf)
+            st = acc.setdefault(
+                n, {'sum': torch.zeros(c, device=device, dtype=torch.float32), 'n': 0}
+            )
+            st['sum'] += x.abs().sum(0)
+            st['n'] += int(x.shape[0])
+        return hook_fn
+
+    for name, module in model.named_modules():
+        if not isinstance(module, CastedLinear) or module.weight.numel() <= 65536:
+            continue
+        wn = name + '.weight'
+        if not _awq_layer_ok(wn, h):
+            continue
+        inf = int(module.weight.shape[1])
+        hooks.append(
+            module.register_forward_hook(
+                make_hook(wn, inf)
+            )
+        )
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_batches):
+            x, _ = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
+            model.forward_logits(x)
+    for hook in hooks:
+        hook.remove()
+    al, lo, hi = h.awq_alpha, h.awq_scale_min, h.awq_scale_max
+    out: dict[str, torch.Tensor] = {}
+    for n, st in acc.items():
+        m = (st['sum'] / max(st['n'], 1)).cpu()
+        s = m.clamp_min(1e-10).pow(al).clamp(lo, hi).to(torch.float16)
+        out[n] = s
+    if h.is_main_process and out:
+        sm = [float(v.min()) for v in out.values()]
+        sx = [float(v.max()) for v in out.values()]
+        me = [float(v.float().mean()) for v in out.values()]
+        log(
+            f"awq_precond: enabled layers={len(out)} alpha={al} scale_min/avg/max "
+            f"={min(sm):.4f} {sum(me)/len(me):.4f} {max(sx):.4f} (per-tensor min/max in log)"
+        )
+    return out
+
+
+def apply_awq_to_weight_copy(t: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    t = t.float()
+    s = scales.float().to(t.device)
+    return (t * s.unsqueeze(0)).to(t.dtype)
+
+
+def _tensor_rel_fake_quant_mse(
+    t: torch.Tensor, hess_name: str, hessians: dict, h, bits: int,
+) -> float:
+    w = t.float()
+    cs = h.embed_clip_sigmas if 'tok_emb' in hess_name else h.matrix_clip_sigmas
+    wq = _lqer_fake_quant_weight(w, cs, bits)
+    den = w.pow(2).sum().clamp_min(1e-20)
+    return float(((w - wq).pow(2).sum() / den).item())
+
+
 def gptq_quantize_weight(w, H, clip_sigmas=3., clip_range=63, block_size=128):
     W_orig = w.float().clone()
     rows, cols = W_orig.shape
@@ -1127,7 +1252,10 @@ def gptq_quantize_weight(w, H, clip_sigmas=3., clip_range=63, block_size=128):
     return Q[:, invperm], s
 
 
-def gptq_mixed_quantize(state_dict, hessians, h):
+def gptq_mixed_quantize(
+    state_dict, hessians, h, per_name_bits: dict | None = None,
+) -> tuple[dict, dict]:
+    pnb = per_name_bits or {}
     result = {}
     meta = {}
     for name, tensor in state_dict.items():
@@ -1136,10 +1264,19 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = 'passthrough (float16)'
             continue
+        if name not in hessians:
+            result[name] = t.to(torch.float16)
+            meta[name] = 'passthrough (no hessian)'
+            continue
         cs = h.embed_clip_sigmas if 'tok_emb' in name else h.matrix_clip_sigmas
-        bits = h.embed_bits if 'tok_emb' in name else h.matrix_bits
-        q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs,
-                                    clip_range=2 ** (bits - 1) - 1)
+        if 'tok_emb' in name:
+            bits = h.embed_bits
+        else:
+            bits = pnb.get(name, h.matrix_bits)
+        cr = 2 ** (bits - 1) - 1
+        q, s = gptq_quantize_weight(
+            t, hessians[name], clip_sigmas=cs, clip_range=cr,
+        )
         result[name + '.q'] = q
         result[name + '.scale'] = s
         meta[name] = f"gptq (int{bits})"
@@ -1151,6 +1288,53 @@ def gptq_mixed_quantize(state_dict, hessians, h):
     for cat in sorted(categories):
         log(f"  {cat}: {', '.join(sorted(categories[cat]))}")
     return result, meta
+
+
+def build_mixed_bit_plan(
+    sd: dict, hessians: dict, h,
+    promote_topk: int | None = None,
+    demote_bottomk: int | None = None,
+) -> dict:
+    """Per-weight bits: high error -> promote, low -> demote (sensitivity proxy)."""
+    pt = h.mixed_bit_promote_topk if promote_topk is None else promote_topk
+    db = h.mixed_bit_demote_bottomk if demote_bottomk is None else demote_bottomk
+    err_list: list[tuple[float, str]] = []
+    for name, t in sd.items():
+        if not name.endswith('.weight'):
+            continue
+        if (not t.is_floating_point() or t.numel() <= 65536
+                or name not in hessians):
+            continue
+        bits0 = h.embed_bits if 'tok_emb' in name else h.matrix_bits
+        e = _tensor_rel_fake_quant_mse(
+            t, name, hessians, h, bits0,
+        )
+        err_list.append((e, name))
+    err_list.sort(key=lambda x: -x[0])
+    if not err_list:
+        return {}
+    plan: dict[str, int] = {}
+    for _, n in err_list:
+        plan[n] = h.embed_bits if 'tok_emb' in n else h.matrix_bits
+    rankable = [n for _, n in err_list if 'tok_emb' not in n]
+    pro = rankable[: min(pt, len(rankable))]
+    dem = rankable[-min(db, len(rankable)) :]
+    for n in pro:
+        plan[n] = h.mixed_bit_promote_bits
+    for n in dem:
+        if n in pro:
+            continue
+        if h.mixed_bit_protect_embed and 'tok_emb' in n:
+            continue
+        if 'head_proj' in n:
+            continue
+        plan[n] = h.mixed_bit_demote_bits
+    if h.is_main_process:
+        log(
+            f"mixed_bit: promoted={pro} demoted={dem} promote_bits={h.mixed_bit_promote_bits} "
+            f"demote_bits={h.mixed_bit_demote_bits}"
+        )
+    return plan
 
 
 def dequantize_mixed(result, meta, template_sd):
@@ -1281,6 +1465,33 @@ def apply_pre_gptq_lqer_merge(h, model: nn.Module) -> None:
 # Serialize / deserialize
 # ---------------------------------------------------------------------------
 
+def _apply_awq_scales_in_place_on_model(awq: dict[str, torch.Tensor], model: nn.Module) -> None:
+    for n, s in awq.items():
+        if not n.endswith('.weight'):
+            continue
+        path = n[:-7]
+        mod: nn.Module = model
+        for p in path.split('.'):
+            mod = getattr(mod, p)
+        if not isinstance(mod, CastedLinear):
+            continue
+        with torch.no_grad():
+            sdev = s.to(device=mod.weight.device, dtype=torch.float32)
+            mod.weight.copy_((mod.weight.float() * sdev.unsqueeze(0)).to(mod.weight.dtype))
+
+
+def _attach_awq_to_model(model: nn.Module, awq: dict, device) -> None:
+    for n, t in awq.items():
+        if not n.endswith('.weight'):
+            continue
+        path = n[:-7]
+        mod: nn.Module = model
+        for p in path.split('.'):
+            mod = getattr(mod, p)
+        if isinstance(mod, CastedLinear):
+            mod.register_buffer('awq_in_scale', t.to(device=device, dtype=torch.float16))
+
+
 def serialize(h, base_model, code):
     code_bytes = len(code.encode('utf-8'))
     if h.is_main_process:
@@ -1288,23 +1499,85 @@ def serialize(h, base_model, code):
         model_bytes = os.path.getsize(h.model_path)
         log(f"Serialized model: {model_bytes} bytes")
         log(f"Code size: {code_bytes} bytes")
-    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     device = torch.device('cuda', h.local_rank)
+    calib_loader = ShuffledSequenceLoader(h, device)
+    awq: dict = {}
+    if h.awq_gptq_precond:
+        awq = collect_awq_mae_scales(
+            base_model, calib_loader, h, device, h.gptq_calibration_batches,
+        )
+        if awq:
+            _apply_awq_scales_in_place_on_model(awq, base_model)
     log('GPTQ:collecting Hessians from calibration data...')
     t0 = time.perf_counter()
-    calib_loader = ShuffledSequenceLoader(h, device)
     hessians = collect_hessians(
         base_model, calib_loader, h, device,
         n_calibration_batches=h.gptq_calibration_batches,
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter() - t0:.1f}s")
-    quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
-    quant_buf = io.BytesIO()
-    torch.save({'w': quant_result, 'm': quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = _compress(quant_raw, h.compressor)
-    quant_file_bytes = len(quant_blob)
-    bytes_total = quant_file_bytes + code_bytes
+    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+    pnb: dict | None = None
+    promote_k = h.mixed_bit_promote_topk
+    if h.mixed_bit_gptq:
+        while promote_k >= 0:
+            pnb = build_mixed_bit_plan(
+                sd_cpu, hessians, h,
+                promote_topk=promote_k,
+                demote_bottomk=h.mixed_bit_demote_bottomk,
+            )
+            if h.mixed_bit_gptq and pnb is not None:
+                promo = sum(1 for n, b in pnb.items() if b == h.mixed_bit_promote_bits)
+                demo = sum(1 for n, b in pnb.items() if b == h.mixed_bit_demote_bits)
+                if h.is_main_process:
+                    log(
+                        f"mixed_bit: estimated promotions={promo} demotions={demo} "
+                        f"bits_matrix_base={h.matrix_bits} promote_topk_try={promote_k}"
+                    )
+            quant_result, quant_meta = gptq_mixed_quantize(
+                sd_cpu, hessians, h, pnb,
+            )
+            quant_buf = io.BytesIO()
+            pay = {'w': quant_result, 'm': quant_meta}
+            if awq:
+                pay['a'] = {k: v.cpu() for k, v in awq.items()}
+            torch.save(pay, quant_buf)
+            quant_raw = quant_buf.getvalue()
+            quant_blob = _compress(quant_raw, h.compressor)
+            quant_file_bytes = len(quant_blob)
+            bytes_total = quant_file_bytes + code_bytes
+            if (not h.art_max_bytes) or bytes_total <= h.art_max_bytes:
+                if promote_k < h.mixed_bit_promote_topk and h.is_main_process:
+                    log(
+                        f"mixed_bit: auto reduced promote_topk to {promote_k} "
+                        f"to fit ART_MAX_BYTES={h.art_max_bytes}"
+                    )
+                break
+            if promote_k == 0:
+                break
+            promote_k -= 1
+            if h.is_main_process:
+                log(
+                    f"artifact: retry mixed_bit promote_topk={promote_k} "
+                    f"(last total={bytes_total} > {h.art_max_bytes})"
+                )
+    else:
+        quant_result, quant_meta = gptq_mixed_quantize(
+            sd_cpu, hessians, h, pnb,
+        )
+        quant_buf = io.BytesIO()
+        pay = {'w': quant_result, 'm': quant_meta}
+        if awq:
+            pay['a'] = {k: v.cpu() for k, v in awq.items()}
+        torch.save(pay, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob = _compress(quant_raw, h.compressor)
+        quant_file_bytes = len(quant_blob)
+        bytes_total = quant_file_bytes + code_bytes
+    if h.art_max_bytes and bytes_total > h.art_max_bytes:
+        raise RuntimeError(
+            f"artifact: total={bytes_total} > ART_MAX_BYTES={h.art_max_bytes} "
+            f"(mixed_bit={h.mixed_bit_gptq}: reduce MIXED_BIT_*, AWQ weights, or code size)"
+        )
     if h.is_main_process:
         with open(h.quantized_model_path, 'wb') as f:
             f.write(quant_blob)
@@ -1324,6 +1597,10 @@ def deserialize(h, device):
     )
     deq_state = dequantize_mixed(quant_state['w'], quant_state['m'], sd_cpu)
     eval_model.load_state_dict(deq_state, strict=True)
+    if 'a' in quant_state and quant_state['a']:
+        _attach_awq_to_model(
+            eval_model, quant_state['a'], device,
+        )
     return eval_model
 
 
@@ -1539,6 +1816,10 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
     iptt_mods: list[IpttMlpOutAdapter] = []
     optims = None
     tit = getattr(h, 'tit_mode', 'lora')
+    if h.ttt_lora and tit == 'iptt':
+        log('ttt: TTT_LORA=1 overrides TIT_MODE=iptt (frozen-base LoRA only; no IPTT path)')
+    if h.ttt_lora:
+        tit = 'lora'
     if tit == 'iptt':
         torch._dynamo.reset()
         iptt_mods = install_ttt_iptt(base_model, h, device)
@@ -1555,13 +1836,29 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
         torch._dynamo.reset()
         lora_mods = install_ttt_lora(base_model, h, device)
         for m in lora_mods:
-            m.init_pissa()
+            if h.ttt_lora_pissa:
+                m.init_pissa()
+            else:
+                with torch.no_grad():
+                    nn.init.normal_(m.lora_A, 0., 0.02)
+                    m.lora_B.zero_()
         _ttt_freeze_lora_only(base_model, lora_mods)
+        n_train = sum(
+            p.numel() for m in lora_mods
+            for p in (m.lora_A, m.lora_B)
+        )
+        lora_ids = {id(m.lora_A) for m in lora_mods} | {id(m.lora_B) for m in lora_mods}
+        for p in base_model.parameters():
+            if p.requires_grad and id(p) not in lora_ids:
+                raise RuntimeError('ttt_lora: unexpected trainable param (base must be frozen)')
         compiled_logits = torch.compile(
             base_model.forward_logits, dynamic=False, fullgraph=True
         )
         log(
-            f"ttt:lora rank={h.lora_rank} attn_last={h.lora_last_n_attn} mlp_last={h.lora_last_n_mlp} "
+            f"ttt_lora: rank={h.lora_rank} modules={len(lora_mods)} mlp_fc={h.ttt_lora_mlp_fc} "
+            f"attn_last={h.lora_last_n_attn} mlp_last={h.lora_last_n_mlp} trainable_ttt={n_train} "
+            f"frozen_base=True score_first=True pissa={h.ttt_lora_pissa} one_step={h.ttt_one_step} "
+            f"clip={h.ttt_lora_clip} difficulty_gate={h.ttt_difficulty_gate} "
             f"chunk={ttt_chunk} tau=({h.ttt_tau_easy},{h.ttt_tau_hard}) adaptive={h.ttt_adaptive}"
         )
     else:
@@ -1594,6 +1891,10 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
         None if use_fast
         else torch.optim.SGD(ttt_params, lr=h.ttt_lr, momentum=h.ttt_momentum)
     )
+    ttt_ema_nat: float | None = None
+    ttt_skipped = ttt_normal = ttt_hard = 0
+    lora_norm_sum = 0.0
+    lora_norm_count = 0
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
         if not windows:
@@ -1609,7 +1910,12 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
             ttt_params = [p for p in base_model.parameters() if p.requires_grad]
         elif h.ttt_lora and lora_mods:
             for m in lora_mods:
-                m.init_pissa()
+                if h.ttt_lora_pissa:
+                    m.init_pissa()
+                else:
+                    with torch.no_grad():
+                        nn.init.normal_(m.lora_A, 0., 0.02)
+                        m.lora_B.zero_()
             optims = _ttt_lora_optim(
                 h, _ttt_freeze_lora_only(base_model, lora_mods)
             )
@@ -1686,6 +1992,21 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
         else:
             n_steps = ttt_full_epochs
         n_steps = min(n_steps, h.ttt_max_inner_steps, inner_cap)
+        if h.ttt_one_step:
+            n_steps = min(n_steps, 1)
+        gate_lr = 1.0
+        if h.ttt_difficulty_gate and ttt_ema_nat is not None and not is_last_chunk:
+            e_nat = h.ttt_easy_margin * math.log(2.0)
+            h_nat = h.ttt_hard_margin * math.log(2.0)
+            if h.ttt_skip_easy and mean_nll < ttt_ema_nat - e_nat:
+                n_steps = 0
+                ttt_skipped += 1
+            elif mean_nll > ttt_ema_nat + h_nat:
+                gate_lr = h.ttt_hard_lr_mult
+                ttt_hard += 1
+            else:
+                gate_lr = h.ttt_normal_lr_mult
+                ttt_normal += 1
         if not is_last_chunk and n_steps > 0 and optimizer is not None:
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
@@ -1696,7 +2017,7 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                     math.pi * ci / max(num_chunks - 1, 1)
                 ))
                 for pg in optimizer.param_groups:
-                    pg['lr'] = cos_lr
+                    pg['lr'] = cos_lr * gate_lr
                 my_seq_s = chunk_seqs * rank // world_size
                 my_seq_e = chunk_seqs * (rank + 1) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
@@ -1743,6 +2064,9 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
             my_chunk_seqs = my_e2 - my_seq_s
             n_bs_loops = (max(0, my_chunk_seqs) + batch_seqs - 1) // batch_seqs
             max_loops = _ttt_max_inner_microsteps(h, n_bs_loops, device)
+            for opt in optims:
+                for g in opt.param_groups:
+                    g['lr'] = g['base_lr'] * gate_lr
             for _ in range(n_steps):
                 for bi in range(max_loops):
                     do_step = bool(
@@ -1773,13 +2097,29 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                         for opt in optims:
                             opt.zero_grad(set_to_none=True)
                     _ttt_ddp_allreduce_grads(world_size, ttt_params)
-                    torch.nn.utils.clip_grad_norm_(ttt_params, 1.)
+                    lora_cl = (h.ttt_lora_clip if h.ttt_lora and h.ttt_lora_clip > 0 else 1.0)
+                    gn = torch.nn.utils.clip_grad_norm_(ttt_params, lora_cl)
+                    if h.ttt_lora:
+                        lora_norm_sum += float(gn)
+                        lora_norm_count += 1
                     for opt in optims:
                         opt.step()
+                    for opt in optims:
+                        for g in opt.param_groups:
+                            g['lr'] = g['base_lr']
+        a_ema = h.ttt_ema_bpb_alpha
+        ttt_ema_nat = (float(mean_nll) if ttt_ema_nat is None
+                      else (1.0 - a_ema) * ttt_ema_nat + a_ema * float(mean_nll))
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+    if h.ttt_lora and lora_mods and rank == 0:
+        avg_ln = lora_norm_sum / max(1, lora_norm_count)
+        log(
+            f"ttt_lora:gate chunks_skipped={ttt_skipped} chunks_normal={ttt_normal} "
+            f"chunks_hard={ttt_hard} avg_lora_grad_norm={avg_ln:.6f} ema_nll={ttt_ema_nat}"
+        )
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
